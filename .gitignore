@@ -1,0 +1,7 @@
+.env
+*.session
+*.session-journal
+audio/
+khutba_archive.json
+khutba_archive.csv
+__pycache__/
