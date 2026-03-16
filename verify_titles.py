@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-verify_titles.py — Compare stored titles against live Telegram message text.
+verify_titles.py — Compare stored titles against live Telegram message data.
 
-For every entry in khutba_archive.json this script fetches the actual Telegram
-message, tries to extract the real title from the message text, and reports
-mismatches so they can be reviewed and corrected.
+Two extraction strategies depending on message type:
+
+  1. Audio document messages  → DocumentAttributeAudio.title  (embedded metadata,
+     most reliable; avoids the decorative `══ا ¤` / `00:00 ─━━` UI noise)
+
+  2. Text / YouTube messages  → targeted regex looking for the channel's own
+     formatting conventions  (🔖…🎙, ◆…◆, 🌀…🌀, بعنوان:…)
+
+Verdict per entry:
+  match    — extracted title confirms the stored one
+  mismatch — extracted title is clearly different (real Arabic content)
+  unclear  — could not extract a reliable title (audio metadata empty + no
+             text pattern matched) — stored title is assumed correct
 
 Output:
-    title_verification.json  — full record per entry (match / mismatch / unclear)
-    title_verification.csv   — same, for easy spreadsheet review
+    title_verification.json   full record per entry
+    title_verification.csv    spreadsheet-friendly (utf-8 BOM)
 
 Usage:
-    python verify_titles.py               # verify all entries
-    python verify_titles.py --apply       # also update titles in khutba_archive.json
-
-The script is safely resumable: if title_verification.json already exists,
-entries already marked "match" or "mismatch" are skipped (use --force to
-re-fetch everything).
+    python verify_titles.py               # verify all
+    python verify_titles.py --force       # re-fetch even already-verified entries
+    python verify_titles.py --apply       # write corrections back to archive JSON
 """
 
 import argparse
@@ -29,6 +36,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeAudio, MessageMediaDocument
 
 load_dotenv()
 
@@ -43,104 +51,140 @@ VERIFY_CSV = Path("title_verification.csv")
 REQUEST_DELAY = 0.8
 
 # ---------------------------------------------------------------------------
-# Title extraction from Telegram message text
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-# Remove these trailing qualifiers from a candidate title so comparison is fair
-_QUALIFIER_RE = re.compile(
-    r"\s*[-–]\s*(?:رحمه الله|حفظه الله|رضي الله عنه|رضي الله عنها|نفع الله به)\s*$"
-)
-
-# Patterns that mark a "speaker / instructions" segment — not part of the title
-_SKIP_RE = re.compile(
-    r"لفضيلة|الشيخ|للتحميل|للاستماع|رابط|تحميل|استماع|مشاهدة"
-    r"|لفضيله|للمشاهدة|اضغط|انقر|متاح|يمكن"
-)
-
-# Patterns that mark the sermon TYPE — not the title
-_TYPE_RE = re.compile(
-    r"^(?:خطبة\s+الجمعة|خطبة\s+العيد|خطبة\s+الاستسقاء|خطبة|درس|محاضرة)\s*$"
-)
-
-# Emoji / punctuation used as separators between inline segments
-_SEGMENT_SPLIT_RE = re.compile(
-    r"[\U0001F300-\U0001F9FF\u2600-\u27BF\u2702-\u27B0"
-    r"\u25A0-\u25FF\u2000-\u206F\u2190-\u21FF]+"
-)
-
-# Invisible / zero-width chars
 _INVISIBLE_RE = re.compile(r"[\u00ad\u200b-\u200f\u2060\u2061\ufeff\u202a-\u202e]")
 
+# Trailing Islamic qualifiers that appear after names/titles
+_QUALIFIER_RE = re.compile(
+    r"\s*[-–]\s*(?:رحمه الله|حفظه الله|ورعاه|رضي الله عنه[ا]?|نفع الله به)\s*$"
+)
 
-def _clean_segment(s: str) -> str:
+# Box-drawing / audio-player decoration characters (══ا ¤, 00:00 ─━━ etc.)
+# These appear in the body of Telegram audio messages and are NOT titles.
+_DECORATION_RE = re.compile(
+    r"[\u2500-\u257F\u2550-\u256C\u2014\u2013═─━\u25BA\u25C4¤●○►◄▶◀]"
+)
+
+# Arabic-Indic → ASCII digit map
+_AR_DIGIT_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def _clean(s: str) -> str:
     s = _INVISIBLE_RE.sub("", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # Strip leading colons / Arabic colons
-    s = re.sub(r"^[\s::\-–]+|[\s::\-–]+$", "", s)
+    s = re.sub(r"^[\s::\-–*]+|[\s::\-–*]+$", "", s)
     return s
 
 
-def extract_title(text: str) -> str:
-    """
-    Heuristically extract the khutba title from Telegram message text.
+def _has_arabic(s: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06ff]", s))
 
-    Returns the best candidate, or "" if nothing convincing was found.
+
+def _strip_qualifiers(s: str) -> str:
+    return _QUALIFIER_RE.sub("", s).strip()
+
+
+def _normalise(s: str) -> str:
+    """Normalise for loose comparison: strip diacritics, punctuation, qualifiers."""
+    s = _strip_qualifiers(s)
+    # Arabic diacritics (harakat + tatweel)
+    s = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", s)
+    # Arabic-Indic digits → ASCII
+    s = s.translate(_AR_DIGIT_MAP)
+    # Drop everything that isn't Arabic letter, ASCII alnum, or ﷺ
+    s = re.sub(r"[^\u0600-\u06ff\w]", "", s)
+    return s.lower()
+
+
+def titles_match(stored: str, extracted: str) -> bool:
+    return bool(extracted) and _normalise(stored) == _normalise(extracted)
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1 — Audio document metadata
+# ---------------------------------------------------------------------------
+
+def get_audio_metadata_title(message) -> str:
+    """
+    Return the title embedded in the audio document's metadata, or "".
+    This is the most reliable source for audio-file messages.
+    """
+    if not isinstance(message.media, MessageMediaDocument):
+        return ""
+    for attr in message.media.document.attributes:
+        if isinstance(attr, DocumentAttributeAudio):
+            return _clean(attr.title or "")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2 — Formatted text extraction (YouTube / text-only messages)
+# ---------------------------------------------------------------------------
+
+def extract_title_from_text(text: str) -> str:
+    """
+    Extract title from formatted message text using the channel's own
+    formatting conventions.  Returns "" if nothing reliable found.
     """
     if not text:
         return ""
 
-    # Remove all URLs
+    # Remove URLs and invisible chars first
     text = re.sub(r"https?://\S+", "", text)
     text = _INVISIBLE_RE.sub("", text)
 
-    # Split into segments: first by newline, then by inline emoji separators
-    lines = [ln.strip() for ln in text.splitlines()]
-    raw_segments: list[str] = []
-    for line in lines:
-        parts = _SEGMENT_SPLIT_RE.split(line)
-        raw_segments.extend(parts)
+    # --- Pattern 1: 🔖 TITLE 🎙 ---
+    # Very common in this channel: خطبة الجمعة🔖 TITLE 🎙 لفضيلة الشيخ...
+    m = re.search(r"🔖\s*(.+?)(?=🎙|🎧|لفضيلة|للشيخ|\n|$)", text)
+    if m:
+        candidate = _clean(m.group(1))
+        candidate = _strip_qualifiers(candidate)
+        if _has_arabic(candidate) and len(candidate) >= 5:
+            return candidate
 
-    candidates: list[str] = []
-    for seg in raw_segments:
-        seg = _clean_segment(seg)
-        # Must contain Arabic
-        if not re.search(r"[\u0600-\u06ff]", seg):
-            continue
-        # Skip type labels
-        if _TYPE_RE.search(seg):
-            continue
-        # Skip speaker / instruction segments
-        if _SKIP_RE.search(seg):
-            continue
-        # Reasonable title length
-        if len(seg) < 5 or len(seg) > 120:
-            continue
-        candidates.append(seg)
+    # --- Pattern 2: symmetric decorators ◆…◆  🌀…🌀  ✿…✿  ❒…❒ ---
+    m = re.search(r"[◆🌀✿❒✦]\s*(.+?)\s*[◆🌀✿❒✦]", text)
+    if m:
+        candidate = _clean(m.group(1))
+        candidate = _strip_qualifiers(candidate)
+        if _has_arabic(candidate) and len(candidate) >= 5:
+            return candidate
 
-    if not candidates:
-        return ""
+    # --- Pattern 3: "بعنوان[:] TITLE" ---
+    m = re.search(r"بعنوان\s*[:\s]\s*(.+?)(?:\n|🎙|لفضيلة|$)", text)
+    if m:
+        candidate = _clean(m.group(1))
+        candidate = _strip_qualifiers(candidate)
+        if _has_arabic(candidate) and len(candidate) >= 5:
+            return candidate
 
-    # Prefer shorter, purer Arabic segments (titles tend to be concise)
-    candidates.sort(key=lambda s: len(s))
-    best = candidates[0]
-    # Strip trailing qualifiers like " - رحمه الله"
-    best = _QUALIFIER_RE.sub("", best).strip()
-    return best
+    return ""
 
 
-def titles_match(stored: str, extracted: str) -> bool:
-    """
-    Loose comparison: ignore punctuation, diacritics, and qualifiers.
-    """
-    def normalise(s: str) -> str:
-        s = _QUALIFIER_RE.sub("", s)
-        # Remove Arabic diacritics (harakat)
-        s = re.sub(r"[\u064b-\u065f\u0670]", "", s)
-        # Remove all non-Arabic non-alphanumeric
-        s = re.sub(r"[^\u0600-\u06ff\w]", "", s)
-        return s.strip().lower()
-
-    return normalise(stored) == normalise(extracted)
+def _is_garbage(s: str) -> bool:
+    """Return True if the candidate title is decorative noise, not a real title."""
+    if not s:
+        return True
+    # Contains box-drawing / audio-player decoration chars
+    if _DECORATION_RE.search(s):
+        return True
+    # Timestamp pattern: 00:00
+    if re.match(r"^\d{1,2}:\d{2}", s):
+        return True
+    # Just a date (١ شوال ١٤٤٤هـ, ١٤٤٣/١٠/١٢هـ)
+    if re.match(r"^[\d٠-٩\s/،]+(?:هـ|م)?$", s):
+        return True
+    # Standalone qualifiers / type words
+    if re.match(
+        r"^(?:رحمه الله|حفظه الله|ورعاه|رضي الله عنه[ا]?"
+        r"|خطبة جمعة|خطبة الجمعة|خطبة العيد"
+        r"|للشيخ|لفضيلة|بعنوان)$",
+        s.strip(),
+    ):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +192,14 @@ def titles_match(stored: str, extracted: str) -> bool:
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "index", "type", "stored_title", "telegram_title", "verdict",
-    "telegram_url", "message_id", "telegram_raw_text",
+    "index", "type", "stored_title", "telegram_title", "title_source",
+    "verdict", "telegram_url", "message_id", "telegram_raw_text",
 ]
 
 
 async def verify(
     client: TelegramClient, records: list[dict], force: bool
 ) -> list[dict]:
-    # Load existing verification results
     existing: dict[int, dict] = {}
     if VERIFY_JSON.exists():
         with open(VERIFY_JSON, encoding="utf-8") as f:
@@ -172,12 +215,13 @@ async def verify(
 
         if not msg_id:
             results.append({**rec, "stored_title": rec.get("title", ""),
-                            "telegram_title": "", "verdict": "no_id",
-                            "telegram_raw_text": ""})
+                            "telegram_title": "", "title_source": "",
+                            "verdict": "no_id", "telegram_raw_text": ""})
             continue
 
         if not force and msg_id in existing:
-            print(f"{tag} Already verified ({existing[msg_id]['verdict']}), skipping.")
+            v = existing[msg_id]["verdict"]
+            print(f"{tag} Already verified ({v}), skipping.")
             results.append(existing[msg_id])
             continue
 
@@ -187,25 +231,37 @@ async def verify(
         except Exception as exc:
             print(f"ERROR — {exc}")
             results.append({**rec, "stored_title": rec.get("title", ""),
-                            "telegram_title": "", "verdict": "error",
-                            "telegram_raw_text": str(exc)})
+                            "telegram_title": "", "title_source": "",
+                            "verdict": "error", "telegram_raw_text": str(exc)})
             await asyncio.sleep(REQUEST_DELAY)
             continue
 
         if not message:
             print("not found.")
             results.append({**rec, "stored_title": rec.get("title", ""),
-                            "telegram_title": "", "verdict": "not_found",
-                            "telegram_raw_text": ""})
+                            "telegram_title": "", "title_source": "",
+                            "verdict": "not_found", "telegram_raw_text": ""})
             await asyncio.sleep(REQUEST_DELAY)
             continue
 
         raw_text = (message.text or message.message or "").strip()
-        # Collapse to single line for the CSV (preserve full version in JSON)
         raw_text_oneline = raw_text.replace("\n", " | ")
-
-        tg_title = extract_title(raw_text)
         stored_title = rec.get("title", "")
+
+        # --- Try Strategy 1: audio metadata ---
+        tg_title = get_audio_metadata_title(message)
+        title_source = "audio_metadata" if tg_title else ""
+
+        # --- Try Strategy 2: text extraction (always run; fills in for non-audio) ---
+        if not tg_title:
+            tg_title = extract_title_from_text(raw_text)
+            if tg_title:
+                title_source = "text_extraction"
+
+        # --- Determine verdict ---
+        if _is_garbage(tg_title):
+            tg_title = ""
+            title_source = ""
 
         if not tg_title:
             verdict = "unclear"
@@ -214,12 +270,14 @@ async def verify(
         else:
             verdict = "mismatch"
 
-        print(f"{verdict}  stored='{stored_title}'  →  tg='{tg_title}'")
+        source_label = f" [{title_source}]" if title_source else ""
+        print(f"{verdict}{source_label}  stored='{stored_title}'  →  tg='{tg_title}'")
 
         results.append({
             **rec,
             "stored_title": stored_title,
             "telegram_title": tg_title,
+            "title_source": title_source,
             "verdict": verdict,
             "telegram_raw_text": raw_text_oneline,
         })
@@ -228,6 +286,10 @@ async def verify(
 
     return results
 
+
+# ---------------------------------------------------------------------------
+# Saving output
+# ---------------------------------------------------------------------------
 
 def save_report(results: list[dict]) -> None:
     with open(VERIFY_JSON, "w", encoding="utf-8") as f:
@@ -242,10 +304,7 @@ def save_report(results: list[dict]) -> None:
 
 
 def apply_corrections(results: list[dict]) -> None:
-    """
-    Update khutba_archive.json: replace titles for mismatch/unclear entries
-    with the telegram_title (only when non-empty).
-    """
+    """Write confirmed telegram_titles back into khutba_archive.json."""
     if not ARCHIVE_JSON.exists():
         print("khutba_archive.json not found — nothing to apply.")
         return
@@ -253,19 +312,20 @@ def apply_corrections(results: list[dict]) -> None:
     with open(ARCHIVE_JSON, encoding="utf-8") as f:
         archive = json.load(f)
 
-    tg_map = {
-        r["message_id"]: r
+    corrections = {
+        r["message_id"]: r["telegram_title"]
         for r in results
-        if r.get("message_id") and r.get("telegram_title")
-        and r["verdict"] in ("mismatch", "unclear")
+        if r.get("message_id")
+        and r.get("telegram_title")
+        and r["verdict"] == "mismatch"
     }
 
     changed = 0
     for rec in archive:
         mid = rec.get("message_id")
-        if mid in tg_map:
+        if mid in corrections:
             old = rec.get("title", "")
-            new = tg_map[mid]["telegram_title"]
+            new = corrections[mid]
             if old != new:
                 print(f"  [{rec['index']:03d}] '{old}'  →  '{new}'")
                 rec["title"] = new
@@ -296,39 +356,42 @@ async def main(force: bool, apply: bool) -> None:
 
     save_report(results)
 
-    mismatches = [r for r in results if r["verdict"] == "mismatch"]
-    unclear = [r for r in results if r["verdict"] == "unclear"]
-    matches = [r for r in results if r["verdict"] == "match"]
+    counts = {v: sum(1 for r in results if r["verdict"] == v)
+              for v in ("match", "mismatch", "unclear", "error", "not_found", "no_id")}
 
     print(
-        f"\nSummary: {len(matches)} match | "
-        f"{len(mismatches)} mismatch | "
-        f"{len(unclear)} unclear"
+        f"\nSummary: {counts['match']} match | "
+        f"{counts['mismatch']} mismatch | "
+        f"{counts['unclear']} unclear (stored title assumed correct)"
     )
 
-    if mismatches:
-        print("\nMismatches:")
-        for r in mismatches:
-            print(
-                f"  [{r['index']:03d}] stored : {r['stored_title']}\n"
-                f"        tg     : {r['telegram_title']}\n"
-                f"        url    : {r['telegram_url']}"
-            )
+    if counts["mismatch"]:
+        print("\nMismatches to review:")
+        for r in results:
+            if r["verdict"] == "mismatch":
+                print(
+                    f"  [{r['index']:03d}] [{r.get('title_source','')}]\n"
+                    f"        stored : {r['stored_title']}\n"
+                    f"        tg     : {r['telegram_title']}\n"
+                    f"        url    : {r['telegram_url']}"
+                )
 
     if apply:
-        print("\nApplying corrections to archive …")
+        print("\nApplying mismatch corrections to archive …")
         apply_corrections(results)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Verify khutba titles against Telegram.")
+    parser = argparse.ArgumentParser(
+        description="Verify khutba titles against live Telegram messages."
+    )
     parser.add_argument(
         "--force", action="store_true",
-        help="Re-fetch all messages even if already verified."
+        help="Re-fetch all messages, ignoring cached verification results."
     )
     parser.add_argument(
         "--apply", action="store_true",
-        help="Write corrected titles back into khutba_archive.json."
+        help="Write mismatched telegram_titles back to khutba_archive.json."
     )
     args = parser.parse_args()
     asyncio.run(main(force=args.force, apply=args.apply))
