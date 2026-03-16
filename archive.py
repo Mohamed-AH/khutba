@@ -22,6 +22,7 @@ import os
 import re
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
@@ -42,6 +43,15 @@ REQUEST_DELAY = 0.8
 
 YOUTUBE_RE = re.compile(
     r"https?://(?:www\.)?(?:youtube\.com/watch\?[^\s]*v=|youtu\.be/)[\w\-]+"
+)
+
+# Direct audio download links found in message text (not Telegram attachments)
+# Covers top4top, archive.org, and bare m4a/mp3/ogg/opus/aac links
+DIRECT_DL_RE = re.compile(
+    r"https?://\S+\.(?:m4a|mp3|ogg|opus|aac)(?:\?[^\s]*)?"
+    r"|https?://[a-z0-9]+\.top4top\.(?:net|io)/[^\s]+"
+    r"|https?://(?:www\.)?archive\.org/download/[^\s]+",
+    re.IGNORECASE,
 )
 
 # Map Arabic-Indic digits → ASCII digits
@@ -141,6 +151,31 @@ def safe_filename(index: int, title: str, ext: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Direct HTTP download helper
+# ---------------------------------------------------------------------------
+
+async def download_direct(url: str, dest: Path) -> bool:
+    """
+    Download a file from a direct HTTP URL to dest.
+    Returns True on success.
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as http:
+            async with http.stream("GET", url) as resp:
+                resp.raise_for_status()
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+        return True
+    except Exception as exc:
+        print(f"  ↳ Direct download failed: {exc}")
+        if dest.exists():
+            dest.unlink()
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Core archiving logic
 # ---------------------------------------------------------------------------
 
@@ -235,9 +270,35 @@ async def process_entries(
                             "audio_file": str(filepath), "youtube_url": None,
                             "date": date_str})
         else:
-            print(f"  ↳ No audio media.")
-            results.append({**entry, "status": "no_media", "audio_file": None,
-                            "youtube_url": None, "date": date_str})
+            # No Telegram document — check message text for a direct download URL
+            dl_m = DIRECT_DL_RE.search(msg_text)
+            if dl_m:
+                dl_url = dl_m.group(0).rstrip(".")
+                ext = Path(dl_url.split("?")[0]).suffix or ".m4a"
+                filename = safe_filename(entry["index"], entry["title"], ext)
+                filepath = OUTPUT_DIR / filename
+                print(f"  ↳ Direct download link: {dl_url}")
+                if filepath.exists():
+                    print(f"  ↳ Already on disk: {filename}")
+                    results.append({**entry, "status": "downloaded",
+                                    "audio_file": str(filepath),
+                                    "youtube_url": None, "date": date_str})
+                else:
+                    print(f"  ↳ Downloading {filename} …")
+                    ok = await download_direct(dl_url, filepath)
+                    if ok:
+                        print(f"  ↳ Saved.")
+                        results.append({**entry, "status": "downloaded",
+                                        "audio_file": str(filepath),
+                                        "youtube_url": None, "date": date_str})
+                    else:
+                        results.append({**entry, "status": "dl_failed",
+                                        "audio_file": None,
+                                        "youtube_url": dl_url, "date": date_str})
+            else:
+                print(f"  ↳ No audio media or download link.")
+                results.append({**entry, "status": "no_media", "audio_file": None,
+                                "youtube_url": None, "date": date_str})
 
         await asyncio.sleep(REQUEST_DELAY)
 
